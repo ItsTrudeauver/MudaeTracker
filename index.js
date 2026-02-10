@@ -238,33 +238,48 @@ client.on('messageCreate', async message => {
 
 // --- LISTENER 2: MUDAE MESSAGES (Repayment Confirmation) ---
 client.on('messageCreate', async message => {
-    // We only care if Mudae speaks
+    // 1. Filter: Must be Mudae
     if (message.author.id !== MUDAE_ID) return;
-    if (!isTrackingEnabled) return;
 
-    // Check if we are expecting a repayment in this channel
+    // 2. Filter: Must be in a channel where we are waiting for a repayment
     const pending = pendingRepayments.get(message.channel.id);
     if (!pending) return;
 
-    // Regex: "**1000**<:kakera:123> removed" OR "1000<...> removed"
-    // Mudae is inconsistent with bolding, so we make ** optional
-    const mudaeRegex = /^\*?(\d+)\*?.*removed/i;
-    const match = message.content.match(mudaeRegex);
+    // --- DEBUG LOGGING (Check your Render logs if this fails!) ---
+    console.log(`🔍 Mudae spoke in pending channel. Content: "${message.content}"`);
 
-    if (match) {
-        const removedAmount = parseInt(match[1]);
+    // 3. LOGIC: LOOSE PARSING
+    // We don't care about formatting. We just look for the specific amount and the word "removed".
+    const content = message.content.toLowerCase();
+    
+    // Check if the specific amount exists in the string (e.g. "1000")
+    // We check `pending.amount` to ensure we don't trigger on random numbers.
+    const hasAmount = content.includes(pending.amount.toString());
+    const hasKeyword = content.includes('removed');
 
-        // Validate Amount (Optional: Check if it matches exactly or is close)
-        if (removedAmount === pending.amount) {
+    if (hasAmount && hasKeyword) {
+        console.log("✅ Match found! Processing repayment...");
+        
+        try {
+            // Apply interest BEFORE payment to be fair
             await applyInterest();
+            
             const logs = await payDebt(pending.userId, pending.amount);
             
-            if (logs.length > 0) await message.reply(`💸 **Confirmed:**\n${logs.join('\n')}`);
-            else await message.reply(`❓ <@${pending.userId}> has no active debts.`);
-            
-            // Clean up
+            if (logs.length > 0) {
+                await message.reply(`💸 **Repayment Confirmed:**\n${logs.join('\n')}`);
+            } else {
+                await message.reply(`❓ <@${pending.userId}> has no active debts.`);
+            }
+        } catch (err) {
+            console.error("Payment Error:", err);
+        } finally {
+            // Clear the pending state so it doesn't trigger twice
             pendingRepayments.delete(message.channel.id);
+            console.log("🧹 Pending repayment cleared.");
         }
+    } else {
+        console.log(`❌ Message ignored. Looking for "${pending.amount}" and "removed".`);
     }
 });
 
