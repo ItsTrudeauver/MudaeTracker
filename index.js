@@ -19,6 +19,7 @@ const GUILD_ID = process.env.GUILD_ID;
 const DATABASE_URL = process.env.DATABASE_URL;
 const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(',').map(id => id.trim());
 
+// IDS & CONSTANTS
 const MUDAE_ID = '432610292342587392'; 
 const CHECKMARK = '✅'; 
 
@@ -87,7 +88,7 @@ const client = new Client({
 });
 
 // --- GLOBAL STATE ---
-let isTrackingEnabled = true; // Default: ON
+let isTrackingEnabled = true; 
 const pendingActions = new Map();
 
 // ==========================================
@@ -215,7 +216,10 @@ client.once('ready', async () => {
     setInterval(() => {
         const now = Date.now();
         for (const [msgId, data] of pendingActions.entries()) {
-            if (now - data.timestamp > 300000) pendingActions.delete(msgId);
+            if (now - data.timestamp > 300000) {
+                pendingActions.delete(msgId);
+                console.log(`🧹 Garbage Collected: Pending action ${msgId} expired.`);
+            }
         }
     }, 60000);
 });
@@ -225,16 +229,17 @@ client.on('messageCreate', async message => {
     if (message.author.bot) return;
     if (!ADMIN_IDS.includes(message.author.id)) return;
     
-    // --- NEW: THE GLOBAL SWITCH CHECK ---
+    // Global Switch
     if (!isTrackingEnabled) return; 
 
     if (message.content.toLowerCase().includes('#exempt')) return;
 
-    const giveRegex = /^\$(givescrap)\s+<@!?(\d+)>\s+(\d+)/i;
-    const takeRegex = /^\$(kakeraremove)\s+<@!?(\d+)>\s+(\d+)/i;
+    const giveRegex = /^\$(givescrap|givekakera)\s+<@!?(\d+)>\s+(\d+)/i;
+    const takeRegex = /^\$(kakeraremove|takekakera)\s+<@!?(\d+)>\s+(\d+)/i;
 
     const giveMatch = message.content.match(giveRegex);
     if (giveMatch) {
+        console.log(`📝 Command detected ($givescrap). Waiting for Mudae reaction...`);
         pendingActions.set(message.id, {
             type: 'LOAN',
             adminId: message.author.id,
@@ -242,11 +247,12 @@ client.on('messageCreate', async message => {
             amount: parseInt(giveMatch[3]),
             timestamp: Date.now()
         });
-        return;
+        return; // <--- STRICT RETURN. NO DB WRITE HERE.
     }
 
     const takeMatch = message.content.match(takeRegex);
     if (takeMatch) {
+        console.log(`📝 Command detected ($kakeraremove). Waiting for Mudae reaction...`);
         pendingActions.set(message.id, {
             type: 'REPAY',
             adminId: message.author.id,
@@ -254,22 +260,29 @@ client.on('messageCreate', async message => {
             amount: parseInt(takeMatch[3]),
             timestamp: Date.now()
         });
-        return;
+        return; // <--- STRICT RETURN. NO DB WRITE HERE.
     }
 });
 
 // --- LISTENER 2: Catch Reaction (The Verification) ---
 client.on('messageReactionAdd', async (reaction, user) => {
-    if (reaction.partial) await reaction.fetch();
+    if (reaction.partial) {
+        try { await reaction.fetch(); } catch (e) { return; }
+    }
+    
+    // Debugging Logs
+    if (user.id === MUDAE_ID && pendingActions.has(reaction.message.id)) {
+        console.log(`👀 Mudae reacted with ${reaction.emoji.name}`);
+    }
+
     if (user.id !== MUDAE_ID) return;
     if (reaction.emoji.name !== CHECKMARK && reaction.emoji.name !== 'white_check_mark') return;
-
-    // --- NEW: THE GLOBAL SWITCH CHECK ---
-    // Even if pending existed, if we turn OFF mode while waiting, we abort.
     if (!isTrackingEnabled) return;
 
     const action = pendingActions.get(reaction.message.id);
     if (!action) return;
+
+    console.log(`✅ Reaction verified. Executing DB Write for ${action.type}...`);
 
     try {
         if (action.type === 'LOAN') {
@@ -295,7 +308,6 @@ client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
     if (!ADMIN_IDS.includes(interaction.user.id)) return interaction.reply({ content: "❌ Unauthorized.", ephemeral: true });
 
-    // --- NEW COMMAND: TOGGLE ---
     if (interaction.commandName === 'debt_toggle') {
         const mode = interaction.options.getString('mode');
         isTrackingEnabled = (mode === 'on');
@@ -303,6 +315,7 @@ client.on('interactionCreate', async interaction => {
         const statusEmoji = isTrackingEnabled ? '🟢' : '🔴';
         const statusText = isTrackingEnabled ? 'ENABLED' : 'DISABLED';
         
+        console.log(`🔄 Tracking toggled to ${statusText}`);
         await interaction.reply(`${statusEmoji} **Debt Tracking is now ${statusText}.**\n${isTrackingEnabled ? 'Bot will record loans.' : 'Bot is sleeping. Mass distributions are safe.'}`);
     }
 
@@ -311,8 +324,6 @@ client.on('interactionCreate', async interaction => {
         const client = await pool.connect();
         try {
             const res = await client.query("SELECT * FROM debts WHERE status='open' ORDER BY borrower_id");
-            
-            // Add status header to the report
             let statusHeader = isTrackingEnabled ? "🟢 **System Status: ONLINE**" : "🔴 **System Status: PAUSED**";
             if (res.rows.length === 0) return interaction.reply(`${statusHeader}\nNo active debts.`);
 
