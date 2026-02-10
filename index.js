@@ -1,38 +1,52 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { 
+    Client, 
+    GatewayIntentBits, 
+    Partials, 
+    REST, 
+    Routes, 
+    SlashCommandBuilder 
+} = require('discord.js');
 const { Pool } = require('pg');
 const express = require('express');
 
-// --- 1. RENDER COMPATIBILITY (The Fake Web Server) ---
+// ==========================================
+// 1. CONFIGURATION
+// ==========================================
+const TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
+const DATABASE_URL = process.env.DATABASE_URL;
+const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(',').map(id => id.trim());
+
+const MUDAE_ID = '432610292342587392'; 
+const CHECKMARK = '✅'; 
+
+if (!TOKEN || !DATABASE_URL || !CLIENT_ID) {
+    console.error("❌ CRITICAL ERROR: Missing .env variables.");
+    process.exit(1);
+}
+
+// ==========================================
+// 2. RENDER COMPATIBILITY
+// ==========================================
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    res.send('Mudae Debt Tracker is running.');
+    res.send(`Mudae Debt Tracker is active. Tracking Mode: ${isTrackingEnabled ? 'ON' : 'OFF'}`);
 });
 
 app.listen(PORT, () => {
     console.log(`✅ Web server listening on port ${PORT}`);
 });
 
-// --- CONFIGURATION ---
-const token = process.env.DISCORD_TOKEN;
-const clientId = process.env.CLIENT_ID;
-const guildId = process.env.GUILD_ID;
-const databaseUrl = process.env.DATABASE_URL;
-const adminIds = (process.env.ADMIN_IDS || "").split(',').map(id => id.trim());
-
-if (!token || !databaseUrl || !clientId) {
-    console.error("❌ Missing .env variables.");
-    process.exit(1);
-}
-
-// --- DATABASE SETUP (With SSL for Cloud) ---
+// ==========================================
+// 3. DATABASE SETUP
+// ==========================================
 const pool = new Pool({
-    connectionString: databaseUrl,
-    ssl: {
-        rejectUnauthorized: false // Required for Neon/Render/Cockroach
-    }
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
 });
 
 async function initDB() {
@@ -51,26 +65,34 @@ async function initDB() {
                 note TEXT
             );
         `);
-        console.log("✅ Database Table Verified.");
+        console.log("✅ Database Schema Verified.");
     } catch (err) {
-        console.error("❌ DB Init Failed:", err);
+        console.error("❌ Database Init Failed:", err);
     } finally {
         client.release();
     }
 }
 
-// --- DISCORD CLIENT ---
+// ==========================================
+// 4. CLIENT & STATE
+// ==========================================
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ]
+        GatewayIntentBits.MessageContent,       
+        GatewayIntentBits.GuildMessageReactions 
+    ],
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction] 
 });
 
-// --- INTEREST LOGIC (The "Notary" Math) ---
-// This logic is safe even if Render puts the bot to sleep.
-// It calculates interest based on the DATE, not a timer.
+// --- GLOBAL STATE ---
+let isTrackingEnabled = true; // Default: ON
+const pendingActions = new Map();
+
+// ==========================================
+// 5. CORE LOGIC
+// ==========================================
 async function applyInterest() {
     const client = await pool.connect();
     try {
@@ -89,8 +111,6 @@ async function applyInterest() {
                 for (let i = 0; i < weeksPassed; i++) {
                     newAmount = Math.ceil(newAmount * 1.05);
                 }
-
-                // Update timestamp exact weeks forward
                 const newDate = new Date(lastInterest);
                 newDate.setDate(newDate.getDate() + (weeksPassed * 7));
 
@@ -98,19 +118,17 @@ async function applyInterest() {
                     "UPDATE debts SET amount_remaining=$1, last_interest_at=$2 WHERE id=$3",
                     [newAmount, newDate.toISOString(), debt.id]
                 );
-                console.log(`📈 Debt #${debt.id}: +${weeksPassed} weeks interest.`);
                 updates++;
             }
         }
-        if (updates > 0) console.log(`✅ Interest updated for ${updates} debts.`);
+        if (updates > 0) console.log(`✅ Interest update complete for ${updates} debts.`);
     } catch (err) {
-        console.error("Interest Error:", err);
+        console.error("Interest Logic Error:", err);
     } finally {
         client.release();
     }
 }
 
-// --- TRANSACTION FUNCTIONS ---
 async function logDebt(borrowerId, adminId, amount, note = "") {
     const client = await pool.connect();
     try {
@@ -157,113 +175,179 @@ async function payDebt(borrowerId, amount) {
     }
 }
 
-// --- COMMANDS ---
+// ==========================================
+// 6. SLASH COMMANDS
+// ==========================================
 const commands = [
     new SlashCommandBuilder().setName('debt_status').setDescription('Show all active debts'),
-    new SlashCommandBuilder().setName('debt_add').setDescription('Manually add debt')
-        .addUserOption(opt => opt.setName('user').setDescription('User').setRequired(true))
+    new SlashCommandBuilder().setName('debt_toggle').setDescription('Turn debt tracking ON or OFF (For mass giveaways)')
+        .addStringOption(option => 
+            option.setName('mode')
+                .setDescription('Enable or Disable tracking')
+                .setRequired(true)
+                .addChoices({ name: 'ON', value: 'on' }, { name: 'OFF', value: 'off' })),
+    new SlashCommandBuilder().setName('debt_add').setDescription('Manually add a debt')
+        .addUserOption(opt => opt.setName('user').setDescription('The borrower').setRequired(true))
         .addIntegerOption(opt => opt.setName('amount').setDescription('Amount').setRequired(true))
-        .addStringOption(opt => opt.setName('note').setDescription('Note')),
-    new SlashCommandBuilder().setName('debt_delete').setDescription('Delete a debt ID')
+        .addStringOption(opt => opt.setName('note').setDescription('Optional note')),
+    new SlashCommandBuilder().setName('debt_delete').setDescription('Delete a specific debt ID')
         .addIntegerOption(opt => opt.setName('id').setDescription('Debt ID').setRequired(true))
-].map(c => c.toJSON());
+].map(command => command.toJSON());
 
-// --- EVENTS ---
+// ==========================================
+// 7. LISTENERS
+// ==========================================
+
 client.once('ready', async () => {
+    console.log(`🤖 Logged in as ${client.user.tag}`);
     await initDB();
-    console.log(`Logged in as ${client.user.tag}`);
 
-    const rest = new REST({ version: '10' }).setToken(token);
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
     try {
-        await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
-        console.log('✅ Commands Registered');
-    } catch (e) { console.error(e); }
+        await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+        console.log('✅ Slash Commands registered.');
+    } catch (error) { console.error(error); }
 
-    // Run interest check on startup (Safe against Render spin-downs)
     await applyInterest();
-    // Then try every hour (if bot stays alive)
     setInterval(applyInterest, 1000 * 60 * 60);
+
+    // Cleanup old pending actions
+    setInterval(() => {
+        const now = Date.now();
+        for (const [msgId, data] of pendingActions.entries()) {
+            if (now - data.timestamp > 300000) pendingActions.delete(msgId);
+        }
+    }, 60000);
 });
 
+// --- LISTENER 1: Catch Command (The Proposal) ---
 client.on('messageCreate', async message => {
-    if (message.author.bot || !adminIds.includes(message.author.id)) return;
+    if (message.author.bot) return;
+    if (!ADMIN_IDS.includes(message.author.id)) return;
+    
+    // --- NEW: THE GLOBAL SWITCH CHECK ---
+    if (!isTrackingEnabled) return; 
+
     if (message.content.toLowerCase().includes('#exempt')) return;
 
-    // Regex: Matches $givescrap or $givekakera | $kakeraremove or $takekakera
-    const giveRegex = /^\$(givescrap|givekakera)\s+<@!?(\d+)>\s+(\d+)/i;
-    const takeRegex = /^\$(kakeraremove|takekakera)\s+<@!?(\d+)>\s+(\d+)/i;
+    const giveRegex = /^\$(givescrap)\s+<@!?(\d+)>\s+(\d+)/i;
+    const takeRegex = /^\$(kakeraremove)\s+<@!?(\d+)>\s+(\d+)/i;
 
-    // ADD DEBT
     const giveMatch = message.content.match(giveRegex);
     if (giveMatch) {
-        const userId = giveMatch[2];
-        const amount = parseInt(giveMatch[3]);
-        // Trigger interest update BEFORE adding new debt to keep timestamps clean
-        await applyInterest(); 
-        const debtId = await logDebt(userId, message.author.id, amount, "Auto-detected");
-        
-        await message.react('📝');
-        await message.channel.send(`📉 **Debt Recorded:** <@${userId}> borrowed **${amount}k** (ID: ${debtId}).`);
+        pendingActions.set(message.id, {
+            type: 'LOAN',
+            adminId: message.author.id,
+            userId: giveMatch[2],
+            amount: parseInt(giveMatch[3]),
+            timestamp: Date.now()
+        });
         return;
     }
 
-    // PAY DEBT
     const takeMatch = message.content.match(takeRegex);
     if (takeMatch) {
-        const userId = takeMatch[2];
-        const amount = parseInt(takeMatch[3]);
-        // Trigger interest update BEFORE payment to ensure they pay the current owed amount
-        await applyInterest();
-        const logs = await payDebt(userId, amount);
-        
-        await message.react('💸');
-        if (logs.length > 0) {
-            await message.channel.send(`**Repayment Recorded:**\n${logs.join('\n')}`);
-        } else {
-            await message.channel.send(`❓ <@${userId}> has no active debts.`);
-        }
+        pendingActions.set(message.id, {
+            type: 'REPAY',
+            adminId: message.author.id,
+            userId: takeMatch[2],
+            amount: parseInt(takeMatch[3]),
+            timestamp: Date.now()
+        });
+        return;
     }
 });
 
+// --- LISTENER 2: Catch Reaction (The Verification) ---
+client.on('messageReactionAdd', async (reaction, user) => {
+    if (reaction.partial) await reaction.fetch();
+    if (user.id !== MUDAE_ID) return;
+    if (reaction.emoji.name !== CHECKMARK && reaction.emoji.name !== 'white_check_mark') return;
+
+    // --- NEW: THE GLOBAL SWITCH CHECK ---
+    // Even if pending existed, if we turn OFF mode while waiting, we abort.
+    if (!isTrackingEnabled) return;
+
+    const action = pendingActions.get(reaction.message.id);
+    if (!action) return;
+
+    try {
+        if (action.type === 'LOAN') {
+            await applyInterest();
+            const debtId = await logDebt(action.userId, action.adminId, action.amount, "Verified by Mudae");
+            await reaction.message.reply(`📉 **Confirmed:** Loan recorded. <@${action.userId}> borrowed **${action.amount}k** (ID: ${debtId}).`);
+        } 
+        else if (action.type === 'REPAY') {
+            await applyInterest();
+            const logs = await payDebt(action.userId, action.amount);
+            if (logs.length > 0) await reaction.message.reply(`💸 **Confirmed:**\n${logs.join('\n')}`);
+            else await reaction.message.reply(`❓ <@${action.userId}> has no active debts.`);
+        }
+    } catch (err) {
+        console.error("Transaction Error:", err);
+    } finally {
+        pendingActions.delete(reaction.message.id);
+    }
+});
+
+// --- LISTENER 3: Slash Commands ---
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
-    if (!adminIds.includes(interaction.user.id)) return interaction.reply({content:"❌ Unauthorized", ephemeral:true});
+    if (!ADMIN_IDS.includes(interaction.user.id)) return interaction.reply({ content: "❌ Unauthorized.", ephemeral: true });
 
-    // Update interest before showing status
-    if (interaction.commandName === 'debt_status') {
-        await applyInterest(); // Ensure report is up to the second
+    // --- NEW COMMAND: TOGGLE ---
+    if (interaction.commandName === 'debt_toggle') {
+        const mode = interaction.options.getString('mode');
+        isTrackingEnabled = (mode === 'on');
+        
+        const statusEmoji = isTrackingEnabled ? '🟢' : '🔴';
+        const statusText = isTrackingEnabled ? 'ENABLED' : 'DISABLED';
+        
+        await interaction.reply(`${statusEmoji} **Debt Tracking is now ${statusText}.**\n${isTrackingEnabled ? 'Bot will record loans.' : 'Bot is sleeping. Mass distributions are safe.'}`);
+    }
+
+    else if (interaction.commandName === 'debt_status') {
+        await applyInterest();
         const client = await pool.connect();
-        const res = await client.query("SELECT * FROM debts WHERE status='open' ORDER BY borrower_id");
-        client.release();
+        try {
+            const res = await client.query("SELECT * FROM debts WHERE status='open' ORDER BY borrower_id");
+            
+            // Add status header to the report
+            let statusHeader = isTrackingEnabled ? "🟢 **System Status: ONLINE**" : "🔴 **System Status: PAUSED**";
+            if (res.rows.length === 0) return interaction.reply(`${statusHeader}\nNo active debts.`);
 
-        if (res.rows.length === 0) return interaction.reply("No active debts.");
-
-        let report = "**Active Debts:**\n";
-        for (const row of res.rows) {
-            const last = new Date(row.last_interest_at);
-            const next = new Date(last);
-            next.setDate(next.getDate() + 7);
-            const daysUntil = Math.ceil((next - new Date()) / (1000 * 60 * 60 * 24));
-            report += `🆔 \`${row.id}\` | <@${row.borrower_id}>: **${row.amount_remaining}k** | Interest in ${daysUntil}d\n`;
+            let report = `${statusHeader}\n**Active Debts:**\n`;
+            for (const row of res.rows) {
+                const last = new Date(row.last_interest_at);
+                const next = new Date(last);
+                next.setDate(next.getDate() + 7);
+                const daysUntil = Math.ceil((next - new Date()) / (1000 * 60 * 60 * 24));
+                report += `🆔 \`${row.id}\` | <@${row.borrower_id}>: **${row.amount_remaining}k** | Interest in ${daysUntil}d\n`;
+            }
+            await interaction.reply(report);
+        } finally {
+            client.release();
         }
-        await interaction.reply(report);
     } 
     
     else if (interaction.commandName === 'debt_add') {
         const user = interaction.options.getUser('user');
         const amount = interaction.options.getInteger('amount');
-        const note = interaction.options.getString('note') || "";
+        const note = interaction.options.getString('note') || "Manual Entry";
         const id = await logDebt(user.id, interaction.user.id, amount, note);
-        await interaction.reply(`✅ Created Debt #${id} for ${user}: ${amount}k`);
+        await interaction.reply(`✅ Manually created Debt #${id} for ${user}: ${amount}k`);
     }
 
     else if (interaction.commandName === 'debt_delete') {
         const id = interaction.options.getInteger('id');
         const client = await pool.connect();
-        await client.query("DELETE FROM debts WHERE id=$1", [id]);
-        client.release();
-        await interaction.reply(`🗑️ Deleted Debt #${id}.`);
+        try {
+            await client.query("DELETE FROM debts WHERE id=$1", [id]);
+            await interaction.reply(`🗑️ Deleted Debt #${id}.`);
+        } finally {
+            client.release();
+        }
     }
 });
 
-client.login(token);
+client.login(TOKEN);
